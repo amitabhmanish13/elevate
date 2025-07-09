@@ -1,5 +1,8 @@
-# Welcome to GitHub Desktop!
+# Elevate
 
-This is your README. READMEs are where you can communicate what your project is and how to use it.
+A modern web app with a React frontend and Go backend.
 
-Write your name on line 6, save it, and then head back to GitHub Desktop.
+## Structure
+- frontend/: React + TypeScript + Vite
+- backend/: Go + Gin API
+
