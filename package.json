@@ -1,0 +1,28 @@
+{
+  "name": "mcp-flight-booking-server",
+  "version": "1.0.0",
+  "description": "MCP server for flight booking with AI-powered context management",
+  "main": "mcp-flight-server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node mcp-flight-server.js",
+    "dev": "node --watch mcp-flight-server.js",
+    "test": "node test-mcp-server.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "flight-booking",
+    "ai",
+    "travel",
+    "booking"
+  ],
+  "author": "Flight Booking Team",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^0.5.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
