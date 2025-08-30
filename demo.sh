@@ -180,25 +180,47 @@ install_cilium() {
     helm uninstall cilium -n kube-system 2>/dev/null || true
     sleep 5
     
-    print_status "Installing Cilium..."
+    # Get the correct API server endpoint for Kind
+    local api_server_ip=$(docker inspect ${CLUSTER_NAME}-control-plane --format '{{ .NetworkSettings.Networks.kind.IPAddress }}' 2>/dev/null || echo "127.0.0.1")
+    local api_server_port=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' | sed 's|https://127.0.0.1:||')
+    
+    print_status "Installing Cilium with API server ${api_server_ip}:${api_server_port}..."
     helm install cilium cilium/cilium \
         --namespace kube-system \
-        --set kubeProxyReplacement=strict \
-        --set k8sServiceHost=127.0.0.1 \
-        --set k8sServicePort=6443 \
+        --set kubeProxyReplacement=true \
+        --set k8sServiceHost=${api_server_ip} \
+        --set k8sServicePort=${api_server_port} \
         --set hubble.relay.enabled=true \
         --set hubble.ui.enabled=true \
         --set hubble.metrics.enabled="{dns,drop,tcp,flow,port-distribution,icmp,http}" \
         --set prometheus.enabled=true \
         --set operator.prometheus.enabled=true \
         --set hubble.enabled=true \
+        --set ipam.mode=kubernetes \
+        --set tunnel=vxlan \
+        --set containerRuntime.integration=containerd \
+        --set cgroup.autoMount.enabled=false \
+        --set cgroup.hostRoot=/sys/fs/cgroup \
         --wait --timeout=300s
     
     # Wait for Cilium pods
     print_status "Waiting for Cilium to be ready..."
     kubectl wait --for=condition=ready pod -l k8s-app=cilium -n kube-system --timeout=180s
     
-    print_success "Cilium installed successfully"
+    # Verify Cilium status
+    print_status "Verifying Cilium installation..."
+    local retries=0
+    while [[ $retries -lt 10 ]]; do
+        if kubectl exec -n kube-system ds/cilium -- cilium status --brief 2>/dev/null | grep -q "OK"; then
+            print_success "Cilium installed and healthy"
+            return 0
+        fi
+        print_status "Waiting for Cilium to be healthy... (attempt $((retries+1))/10)"
+        sleep 10
+        ((retries++))
+    done
+    
+    print_warning "Cilium installed but health check timed out - continuing anyway"
 }
 
 # Install monitoring stack
@@ -460,6 +482,33 @@ EOF
     print_success "Load generator started"
 }
 
+# Apply network policies for demo
+apply_network_policies() {
+    print_status "Applying Cilium network policies..."
+    cat << EOF | kubectl apply -f -
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: demo-policy
+  namespace: ${DEMO_NAMESPACE}
+spec:
+  endpointSelector:
+    matchLabels:
+      app: backend
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: frontend
+    - matchLabels:
+        app: load-generator
+    toPorts:
+    - ports:
+      - port: "80"
+        protocol: TCP
+EOF
+    print_success "Network policies applied"
+}
+
 # Setup port forwards
 setup_port_forwards() {
     print_header "Setting up Port Forwards"
@@ -568,6 +617,7 @@ main() {
     install_monitoring
     deploy_demo_app
     generate_load
+    apply_network_policies
     
     # Wait a bit for everything to settle
     print_status "Waiting for all components to be ready..."
