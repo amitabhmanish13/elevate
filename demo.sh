@@ -171,10 +171,24 @@ create_cluster() {
 install_cilium() {
     print_header "Installing Cilium CNI"
     
-    # Clean up any existing helm repos
+    # Clean up any existing helm repos with retry
     helm repo remove cilium 2>/dev/null || true
-    helm repo add cilium https://helm.cilium.io/
-    helm repo update
+    
+    local retries=0
+    while [[ $retries -lt 3 ]]; do
+        print_status "Adding Cilium helm repository (attempt $((retries+1))/3)..."
+        if helm repo add cilium https://helm.cilium.io/ && helm repo update; then
+            break
+        fi
+        print_warning "Failed to update helm repos, retrying in 10 seconds..."
+        sleep 10
+        ((retries++))
+    done
+    
+    if [[ $retries -eq 3 ]]; then
+        print_error "Failed to update helm repositories after 3 attempts"
+        exit 1
+    fi
     
     # Uninstall existing Cilium if present
     helm uninstall cilium -n kube-system 2>/dev/null || true
@@ -189,71 +203,99 @@ install_cilium() {
     
     print_status "Using API server: ${api_server_host}:${api_server_port}"
     
-    # Install Cilium with current v1.16+ compatible settings
-    helm install cilium cilium/cilium \
-        --namespace kube-system \
-        --set kubeProxyReplacement=true \
-        --set k8sServiceHost=${api_server_host} \
-        --set k8sServicePort=${api_server_port} \
-        --set hubble.relay.enabled=true \
-        --set hubble.ui.enabled=true \
-        --set hubble.metrics.enabled="{dns,drop,tcp,flow,port-distribution,icmp,http}" \
-        --set prometheus.enabled=true \
-        --set operator.prometheus.enabled=true \
-        --set hubble.enabled=true \
-        --wait --timeout=300s
-    
-    # Wait for Cilium pods
-    print_status "Waiting for Cilium to be ready..."
-    kubectl wait --for=condition=ready pod -l k8s-app=cilium -n kube-system --timeout=180s
-    
-    # Verify Cilium status
-    print_status "Verifying Cilium installation..."
-    local retries=0
-    while [[ $retries -lt 10 ]]; do
-        if kubectl exec -n kube-system ds/cilium -- cilium status --brief 2>/dev/null | grep -q "OK"; then
-            print_success "Cilium installed and healthy"
-            return 0
+    # Install Cilium with shorter timeout and retry logic
+    local install_retries=0
+    while [[ $install_retries -lt 2 ]]; do
+        print_status "Installing Cilium (attempt $((install_retries+1))/2)..."
+        if helm install cilium cilium/cilium \
+            --namespace kube-system \
+            --set kubeProxyReplacement=true \
+            --set k8sServiceHost=${api_server_host} \
+            --set k8sServicePort=${api_server_port} \
+            --set hubble.relay.enabled=true \
+            --set hubble.ui.enabled=true \
+            --set hubble.metrics.enabled="{dns,drop,tcp,flow,port-distribution,icmp,http}" \
+            --set prometheus.enabled=true \
+            --set operator.prometheus.enabled=true \
+            --set hubble.enabled=true \
+            --timeout=120s; then
+            break
         fi
-        print_status "Waiting for Cilium to be healthy... (attempt $((retries+1))/10)"
+        
+        print_warning "Cilium installation failed, cleaning up and retrying..."
+        helm uninstall cilium -n kube-system 2>/dev/null || true
         sleep 10
-        ((retries++))
+        ((install_retries++))
     done
     
-    print_warning "Cilium installed but health check timed out - continuing anyway"
+    if [[ $install_retries -eq 2 ]]; then
+        print_error "Failed to install Cilium after 2 attempts"
+        exit 1
+    fi
+    
+    # Wait for Cilium pods with shorter timeout
+    print_status "Waiting for Cilium to be ready..."
+    kubectl wait --for=condition=ready pod -l k8s-app=cilium -n kube-system --timeout=120s || {
+        print_warning "Cilium pods not ready yet, checking status..."
+        kubectl get pods -n kube-system -l k8s-app=cilium
+    }
+    
+    print_success "Cilium installation completed"
 }
 
 # Install monitoring stack
 install_monitoring() {
     print_header "Installing Monitoring Stack"
     
-    # Clean up existing repos
+    # Skip monitoring stack if network issues persist
+    print_status "Installing lightweight monitoring (skipping if network issues)..."
+    
+    # Clean up existing repos with timeout
     helm repo remove prometheus-community 2>/dev/null || true
-    helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-    helm repo update
+    
+    # Try to add prometheus repo with timeout
+    local repo_retries=0
+    while [[ $repo_retries -lt 2 ]]; do
+        print_status "Adding Prometheus helm repository (attempt $((repo_retries+1))/2)..."
+        if timeout 30s helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null && timeout 30s helm repo update 2>/dev/null; then
+            break
+        fi
+        print_warning "Prometheus repo update failed, will skip monitoring stack"
+        ((repo_retries++))
+    done
+    
+    if [[ $repo_retries -eq 2 ]]; then
+        print_warning "Skipping monitoring stack due to network connectivity issues"
+        return 0
+    fi
     
     # Create monitoring namespace
     kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
     
     # Uninstall existing if present
     helm uninstall prometheus -n monitoring 2>/dev/null || true
-    sleep 10
+    sleep 5
     
-    print_status "Installing Prometheus and Grafana..."
-    helm install prometheus prometheus-community/kube-prometheus-stack \
+    # Install lightweight Prometheus with shorter timeout
+    print_status "Installing lightweight Prometheus stack..."
+    if ! helm install prometheus prometheus-community/kube-prometheus-stack \
         --namespace monitoring \
-        --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
-        --set prometheus.prometheusSpec.retention=30m \
-        --set prometheus.prometheusSpec.resources.requests.memory=256Mi \
-        --set prometheus.prometheusSpec.resources.requests.cpu=100m \
+        --set prometheus.prometheusSpec.retention=15m \
+        --set prometheus.prometheusSpec.resources.requests.memory=128Mi \
+        --set prometheus.prometheusSpec.resources.requests.cpu=50m \
         --set alertmanager.enabled=false \
         --set grafana.adminPassword=admin \
         --set grafana.persistence.enabled=false \
-        --set grafana.resources.requests.memory=64Mi \
-        --set grafana.resources.requests.cpu=50m \
+        --set grafana.resources.requests.memory=32Mi \
+        --set grafana.resources.requests.cpu=25m \
         --set nodeExporter.enabled=false \
-        --set kubeStateMetrics.enabled=true \
-        --wait --timeout=300s
+        --set kubeStateMetrics.enabled=false \
+        --set prometheusOperator.resources.requests.memory=64Mi \
+        --set prometheusOperator.resources.requests.cpu=25m \
+        --timeout=120s 2>/dev/null; then
+        print_warning "Monitoring stack installation failed - continuing without it"
+        return 0
+    fi
     
     print_success "Monitoring stack installed successfully"
 }
@@ -522,10 +564,15 @@ setup_port_forwards() {
     kubectl port-forward -n kube-system svc/hubble-ui 12000:80 > /dev/null 2>&1 &
     HUBBLE_PID=$!
     
-    # Setup Grafana
-    print_status "Setting up Grafana port forward..."
-    kubectl port-forward -n monitoring svc/prometheus-grafana 13000:80 > /dev/null 2>&1 &
-    GRAFANA_PID=$!
+    # Setup Grafana (if available)
+    if kubectl get svc prometheus-grafana -n monitoring &>/dev/null; then
+        print_status "Setting up Grafana port forward..."
+        kubectl port-forward -n monitoring svc/prometheus-grafana 13000:80 > /dev/null 2>&1 &
+        GRAFANA_PID=$!
+    else
+        print_warning "Grafana not available - skipping port forward"
+        GRAFANA_PID=""
+    fi
     
     # Setup demo app
     print_status "Setting up demo app port forward..."
@@ -550,7 +597,11 @@ display_dashboards() {
     print_success "📊 Dashboard URLs:"
     echo "  • Demo Application:  http://localhost:18080"
     echo "  • Hubble UI:         http://localhost:12000"
-    echo "  • Grafana:           http://localhost:13000 (admin/admin)"
+    if [[ ! -z "$GRAFANA_PID" ]]; then
+        echo "  • Grafana:           http://localhost:13000 (admin/admin)"
+    else
+        echo "  • Grafana:           Not available (network issues during installation)"
+    fi
     
     echo ""
     print_success "🔍 Useful Commands:"
@@ -585,7 +636,7 @@ cleanup() {
     
     # Kill port forwards
     [[ ! -z "$HUBBLE_PID" ]] && kill $HUBBLE_PID 2>/dev/null || true
-    [[ ! -z "$GRAFANA_PID" ]] && kill $GRAFANA_PID 2>/dev/null || true
+    [[ ! -z "$GRAFANA_PID" && "$GRAFANA_PID" != "" ]] && kill $GRAFANA_PID 2>/dev/null || true
     [[ ! -z "$DEMO_PID" ]] && kill $DEMO_PID 2>/dev/null || true
     
     # Kill any remaining port forwards
