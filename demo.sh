@@ -321,11 +321,8 @@ install_monitoring() {
     print_status "Installing minimal Grafana..."
     kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || true
     
-    # Simple Grafana deployment (no external charts)
-    cat << EOF | kubectl apply -f - 2>/dev/null || {
-        print_warning "Failed to deploy monitoring - continuing without it"
-        return 0
-    }
+    # Create Grafana YAML file
+    cat > grafana-deployment.yaml << 'GRAFANA_EOF'
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -376,10 +373,18 @@ spec:
   ports:
   - port: 3000
     targetPort: 3000
-EOF
+GRAFANA_EOF
     
-    MONITORING_READY=true
-    print_success "Basic monitoring installed"
+    # Apply the deployment
+    if kubectl apply -f grafana-deployment.yaml 2>/dev/null; then
+        MONITORING_READY=true
+        print_success "Basic monitoring installed"
+    else
+        print_warning "Failed to deploy monitoring - continuing without it"
+    fi
+    
+    # Cleanup temp file
+    rm -f grafana-deployment.yaml
 }
 
 # Ultra-lightweight demo application
@@ -627,7 +632,7 @@ data:
                 try {
                     const response = await fetch('/api/health');
                     const data = await response.json();
-                    document.getElementById('status').textContent = \`✅ \${data.service} healthy (Pod: \${data.pod})\`;
+                    document.getElementById('status').textContent = '✅ ' + data.service + ' healthy (Pod: ' + data.pod + ')';
                     document.getElementById('status').className = 'status healthy';
                     return true;
                 } catch (error) {
@@ -642,7 +647,7 @@ data:
                     const response = await fetch('/api/users');
                     const users = await response.json();
                     document.getElementById('users').innerHTML = users.map(u => 
-                        \`<div style="padding: 5px; border-left: 3px solid #4f46e5; margin: 5px 0; background: white; border-radius: 3px;">👤 \${u.name} (ID: \${u.id}) - \${u.status}</div>\`
+                        '<div style="padding: 5px; border-left: 3px solid #4f46e5; margin: 5px 0; background: white; border-radius: 3px;">👤 ' + u.name + ' (ID: ' + u.id + ') - ' + u.status + '</div>'
                     ).join('');
                 } catch (error) {
                     document.getElementById('users').innerHTML = '<div style="color: #ef4444;">Failed to load users</div>';
@@ -676,13 +681,13 @@ data:
                         const response = await fetch(test.url);
                         const duration = Date.now() - start;
                         const status = response.ok ? '✅' : '❌';
-                        output.innerHTML += \`\${status} \${test.name}: \${duration}ms<br>\`;
+                        output.innerHTML += status + ' ' + test.name + ': ' + duration + 'ms<br>';
                     } catch (error) {
-                        output.innerHTML += \`❌ \${test.name}: Failed<br>\`;
+                        output.innerHTML += '❌ ' + test.name + ': Failed<br>';
                     }
                 }
                 
-                output.innerHTML += \`<br>Test run #\${testCount} completed at \${new Date().toLocaleTimeString()}<br>\`;
+                output.innerHTML += '<br>Test run #' + testCount + ' completed at ' + new Date().toLocaleTimeString() + '<br>';
                 output.scrollTop = output.scrollHeight;
             }
             
@@ -771,15 +776,12 @@ EOF
 # Apply minimal network policies
 apply_network_policies() {
     print_status "Applying network policies..."
-    cat << EOF | kubectl apply -f - 2>/dev/null || {
-        print_warning "Network policies failed - Cilium may not be ready yet"
-        return 0
-    }
+    cat > network-policy.yaml << 'POLICY_EOF'
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
   name: demo-backend-policy
-  namespace: ${DEMO_NAMESPACE}
+  namespace: demo
 spec:
   endpointSelector:
     matchLabels:
@@ -790,8 +792,15 @@ spec:
         app: frontend
     - matchLabels:
         app: load-generator
-EOF
-    print_success "Network policies applied"
+POLICY_EOF
+    
+    if kubectl apply -f network-policy.yaml 2>/dev/null; then
+        print_success "Network policies applied"
+    else
+        print_warning "Network policies failed - Cilium may not be ready yet"
+    fi
+    
+    rm -f network-policy.yaml
 }
 
 # Fast port forward setup
@@ -951,7 +960,7 @@ cleanup() {
     pkill -f "kubectl port-forward" 2>/dev/null || true
     
     # Clean up files
-    rm -f kind-config.yaml
+    rm -f kind-config.yaml grafana-deployment.yaml network-policy.yaml
     
     print_status "Debug log saved to: $DEBUG_LOG"
     print_success "Cleanup completed"
