@@ -101,6 +101,18 @@ check_dependencies() {
         print_error "Docker is not running. Please start Docker Desktop."
         exit 1
     fi
+    
+    # Check network connectivity
+    print_status "Checking network connectivity..."
+    if command -v curl &> /dev/null; then
+        if ! curl -s --connect-timeout 5 https://helm.cilium.io > /dev/null; then
+            print_warning "Network connectivity issues detected - some components may be skipped"
+        else
+            print_success "Network connectivity OK"
+        fi
+    else
+        print_status "curl not available - skipping network test"
+    fi
 }
 
 # Create simple Kind cluster configuration
@@ -233,12 +245,56 @@ install_cilium() {
         exit 1
     fi
     
-    # Wait for Cilium pods with shorter timeout
+    # Wait for Cilium pods with better error handling
     print_status "Waiting for Cilium to be ready..."
-    kubectl wait --for=condition=ready pod -l k8s-app=cilium -n kube-system --timeout=120s || {
+    
+    # First wait for pods to exist
+    local wait_retries=0
+    while [[ $wait_retries -lt 12 ]]; do
+        if kubectl get pods -n kube-system -l k8s-app=cilium --no-headers 2>/dev/null | grep -q cilium; then
+            break
+        fi
+        print_status "Waiting for Cilium pods to be created... ($((wait_retries+1))/12)"
+        sleep 10
+        ((wait_retries++))
+    done
+    
+    # Wait for Cilium pods to be ready (with longer timeout for init containers)
+    if ! kubectl wait --for=condition=ready pod -l k8s-app=cilium -n kube-system --timeout=300s; then
         print_warning "Cilium pods not ready yet, checking status..."
         kubectl get pods -n kube-system -l k8s-app=cilium
-    }
+        kubectl describe pods -n kube-system -l k8s-app=cilium | tail -20
+        
+        # Try to restart Cilium pods if they're stuck
+        print_status "Attempting to restart Cilium pods..."
+        kubectl delete pods -n kube-system -l k8s-app=cilium --force --grace-period=0 2>/dev/null || true
+        sleep 30
+        
+        # Wait again after restart
+        kubectl wait --for=condition=ready pod -l k8s-app=cilium -n kube-system --timeout=180s || {
+            print_warning "Cilium still not ready - continuing anyway (may work for basic demo)"
+        }
+    fi
+    
+    # Additional Cilium health checks and fixes
+    print_status "Performing Cilium health checks..."
+    
+    # Check if Cilium operator is running
+    if ! kubectl get pods -n kube-system -l name=cilium-operator --no-headers 2>/dev/null | grep -q Running; then
+        print_status "Waiting for Cilium operator..."
+        kubectl wait --for=condition=ready pod -l name=cilium-operator -n kube-system --timeout=120s || true
+    fi
+    
+    # Check Cilium agent status
+    local cilium_pods=$(kubectl get pods -n kube-system -l k8s-app=cilium --no-headers 2>/dev/null | wc -l)
+    local ready_pods=$(kubectl get pods -n kube-system -l k8s-app=cilium --no-headers 2>/dev/null | grep Running | wc -l)
+    
+    print_status "Cilium status: $ready_pods/$cilium_pods pods ready"
+    
+    if [[ $ready_pods -eq 0 ]]; then
+        print_warning "No Cilium pods ready yet, but continuing with demo setup..."
+        print_status "Cilium may take a few more minutes to initialize on first run"
+    fi
     
     print_success "Cilium installation completed"
 }
@@ -265,7 +321,58 @@ install_monitoring() {
     done
     
     if [[ $repo_retries -eq 2 ]]; then
-        print_warning "Skipping monitoring stack due to network connectivity issues"
+        print_warning "Skipping external monitoring stack due to network connectivity issues"
+        print_status "Installing basic monitoring using kubectl manifests..."
+        
+        # Create a simple Grafana deployment without external charts
+        kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+        
+        cat << EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+      - name: grafana
+        image: grafana/grafana:latest
+        ports:
+        - containerPort: 3000
+        env:
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          value: admin
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  selector:
+    app: grafana
+  ports:
+  - port: 3000
+    targetPort: 3000
+EOF
+        
+        print_success "Basic monitoring installed"
         return 0
     fi
     
@@ -564,10 +671,14 @@ setup_port_forwards() {
     kubectl port-forward -n kube-system svc/hubble-ui 12000:80 > /dev/null 2>&1 &
     HUBBLE_PID=$!
     
-    # Setup Grafana (if available)
+    # Setup Grafana (check both prometheus-grafana and basic grafana)
     if kubectl get svc prometheus-grafana -n monitoring &>/dev/null; then
-        print_status "Setting up Grafana port forward..."
+        print_status "Setting up Prometheus Grafana port forward..."
         kubectl port-forward -n monitoring svc/prometheus-grafana 13000:80 > /dev/null 2>&1 &
+        GRAFANA_PID=$!
+    elif kubectl get svc grafana -n monitoring &>/dev/null; then
+        print_status "Setting up basic Grafana port forward..."
+        kubectl port-forward -n monitoring svc/grafana 13000:3000 > /dev/null 2>&1 &
         GRAFANA_PID=$!
     else
         print_warning "Grafana not available - skipping port forward"
@@ -665,14 +776,18 @@ main() {
     check_dependencies
     create_cluster
     install_cilium
-    install_monitoring
+    
+    # Continue with demo app even if monitoring fails
     deploy_demo_app
     generate_load
     apply_network_policies
     
+    # Try monitoring installation (may fail due to network issues)
+    install_monitoring
+    
     # Wait a bit for everything to settle
     print_status "Waiting for all components to be ready..."
-    sleep 15
+    sleep 20
     
     setup_port_forwards
     display_dashboards
