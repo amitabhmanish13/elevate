@@ -180,15 +180,20 @@ install_cilium() {
     helm uninstall cilium -n kube-system 2>/dev/null || true
     sleep 5
     
-    # Get the correct API server endpoint for Kind
-    local api_server_ip=$(docker inspect ${CLUSTER_NAME}-control-plane --format '{{ .NetworkSettings.Networks.kind.IPAddress }}' 2>/dev/null || echo "127.0.0.1")
-    local api_server_port=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' | sed 's|https://127.0.0.1:||')
+    print_status "Installing Cilium with minimal configuration..."
     
-    print_status "Installing Cilium with API server ${api_server_ip}:${api_server_port}..."
+    # Get the actual API server endpoint from kubectl config
+    local api_server_endpoint=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+    local api_server_host=$(echo $api_server_endpoint | sed 's|https://||' | cut -d: -f1)
+    local api_server_port=$(echo $api_server_endpoint | sed 's|https://||' | cut -d: -f2)
+    
+    print_status "Using API server: ${api_server_host}:${api_server_port}"
+    
+    # Install Cilium with current v1.16+ compatible settings
     helm install cilium cilium/cilium \
         --namespace kube-system \
         --set kubeProxyReplacement=true \
-        --set k8sServiceHost=${api_server_ip} \
+        --set k8sServiceHost=${api_server_host} \
         --set k8sServicePort=${api_server_port} \
         --set hubble.relay.enabled=true \
         --set hubble.ui.enabled=true \
@@ -196,11 +201,6 @@ install_cilium() {
         --set prometheus.enabled=true \
         --set operator.prometheus.enabled=true \
         --set hubble.enabled=true \
-        --set ipam.mode=kubernetes \
-        --set tunnel=vxlan \
-        --set containerRuntime.integration=containerd \
-        --set cgroup.autoMount.enabled=false \
-        --set cgroup.hostRoot=/sys/fs/cgroup \
         --wait --timeout=300s
     
     # Wait for Cilium pods
