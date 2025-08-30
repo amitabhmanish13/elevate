@@ -14,28 +14,72 @@ NC='\033[0m' # No Color
 # Configuration
 CLUSTER_NAME="cilium-demo"
 DEMO_NAMESPACE="demo"
+DEBUG_LOG="/tmp/cilium-demo-debug.log"
+START_TIME=$(date +%s)
 
-# Print colored output
+# Global state tracking
+CILIUM_READY=false
+MONITORING_READY=false
+DEMO_APP_READY=false
+NETWORK_ISSUES=false
+
+# Debug and logging functions
+setup_debug() {
+    # Create debug log
+    echo "=== Cilium Demo Debug Log - $(date) ===" > "$DEBUG_LOG"
+    echo "Architecture: $(uname -m)" >> "$DEBUG_LOG"
+    echo "OS: $(uname -s)" >> "$DEBUG_LOG"
+    echo "Docker version: $(docker --version 2>/dev/null || echo 'Not available')" >> "$DEBUG_LOG"
+    echo "kubectl version: $(kubectl version --client --short 2>/dev/null || echo 'Not available')" >> "$DEBUG_LOG"
+    echo "kind version: $(kind --version 2>/dev/null || echo 'Not available')" >> "$DEBUG_LOG"
+    echo "helm version: $(helm version --short 2>/dev/null || echo 'Not available')" >> "$DEBUG_LOG"
+    echo "======================================" >> "$DEBUG_LOG"
+}
+
+debug_log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$DEBUG_LOG"
+}
+
+capture_error() {
+    local component="$1"
+    local error_msg="$2"
+    debug_log "ERROR in $component: $error_msg"
+    
+    # Capture cluster state
+    echo "=== $component Error Details ===" >> "$DEBUG_LOG"
+    echo "Error: $error_msg" >> "$DEBUG_LOG"
+    kubectl get nodes -o wide >> "$DEBUG_LOG" 2>&1 || true
+    kubectl get pods --all-namespaces >> "$DEBUG_LOG" 2>&1 || true
+    kubectl get events --all-namespaces --sort-by='.lastTimestamp' | tail -20 >> "$DEBUG_LOG" 2>&1 || true
+    echo "================================" >> "$DEBUG_LOG"
+}
+
+# Print colored output with debug logging
 print_status() {
     echo -e "${BLUE}[INFO]${NC} $1"
+    debug_log "INFO: $1"
 }
 
 print_success() {
     echo -e "${GREEN}[SUCCESS]${NC} $1"
+    debug_log "SUCCESS: $1"
 }
 
 print_warning() {
     echo -e "${YELLOW}[WARNING]${NC} $1"
+    debug_log "WARNING: $1"
 }
 
 print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+    debug_log "ERROR: $1"
 }
 
 print_header() {
     echo -e "${PURPLE}================================${NC}"
     echo -e "${PURPLE}$1${NC}"
     echo -e "${PURPLE}================================${NC}"
+    debug_log "SECTION: $1"
 }
 
 # Detect architecture
@@ -50,14 +94,15 @@ detect_arch() {
             ;;
         *)
             print_error "Unsupported architecture: $arch"
+            capture_error "ARCH_DETECTION" "Unsupported architecture: $arch"
             exit 1
             ;;
     esac
 }
 
-# Check and install dependencies
+# Fast dependency check with parallel operations
 check_dependencies() {
-    print_header "Checking Dependencies"
+    print_header "Fast Dependency Check"
     
     # Check if running on macOS
     if [[ "$(uname)" != "Darwin" ]]; then
@@ -66,35 +111,27 @@ check_dependencies() {
     
     # Check for Homebrew
     if ! command -v brew &> /dev/null; then
-        print_error "Homebrew not found. Please install Homebrew first: https://brew.sh"
+        print_error "Homebrew not found. Please install: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
         exit 1
     fi
     
-    # Install dependencies
+    # Quick dependency check (no auto-install for speed)
+    local missing_deps=()
     local deps=("docker" "kubectl" "kind" "helm")
+    
     for dep in "${deps[@]}"; do
         if ! command -v $dep &> /dev/null; then
-            print_status "Installing $dep..."
-            case $dep in
-                docker)
-                    brew install --cask docker
-                    print_warning "Please start Docker Desktop and wait for it to be ready"
-                    read -p "Press Enter when Docker is running..."
-                    ;;
-                kubectl)
-                    brew install kubectl
-                    ;;
-                kind)
-                    brew install kind
-                    ;;
-                helm)
-                    brew install helm
-                    ;;
-            esac
+            missing_deps+=($dep)
         else
-            print_success "$dep is already installed"
+            print_success "$dep is available"
         fi
     done
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        print_error "Missing dependencies: ${missing_deps[*]}"
+        print_status "Install with: brew install ${missing_deps[*]}"
+        exit 1
+    fi
     
     # Check if Docker is running
     if ! docker info &> /dev/null; then
@@ -102,22 +139,21 @@ check_dependencies() {
         exit 1
     fi
     
-    # Check network connectivity
-    print_status "Checking network connectivity..."
+    # Quick network connectivity test
+    print_status "Testing network connectivity..."
     if command -v curl &> /dev/null; then
-        if ! curl -s --connect-timeout 5 https://helm.cilium.io > /dev/null; then
-            print_warning "Network connectivity issues detected - some components may be skipped"
+        if ! timeout 10s curl -s https://registry.k8s.io > /dev/null 2>&1; then
+            NETWORK_ISSUES=true
+            print_warning "Network connectivity issues detected - will use offline/cached resources where possible"
         else
             print_success "Network connectivity OK"
         fi
-    else
-        print_status "curl not available - skipping network test"
     fi
 }
 
-# Create simple Kind cluster configuration
+# Minimal Kind cluster configuration for speed
 create_kind_config() {
-    print_status "Creating simple Kind cluster configuration..."
+    print_status "Creating minimal Kind cluster configuration..."
     
     cat > kind-config.yaml << EOF
 kind: Cluster
@@ -132,202 +168,164 @@ nodes:
     nodeRegistration:
       kubeletExtraArgs:
         node-labels: "ingress-ready=true"
+        max-pods: "50"
+  - |
+    kind: ClusterConfiguration
+    etcd:
+      local:
+        extraArgs:
+          quota-backend-bytes: "1073741824"
+    apiServer:
+      extraArgs:
+        enable-admission-plugins: "NodeRestriction"
   extraPortMappings:
   - containerPort: 80
     hostPort: 8080
     protocol: TCP
-  - containerPort: 443
-    hostPort: 8443
-    protocol: TCP
 networking:
   disableDefaultCNI: true
   kubeProxyMode: "none"
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/16"
 EOF
 }
 
-# Create Kind cluster
+# Fast cluster creation
 create_cluster() {
-    print_header "Creating Kind Cluster"
+    print_header "Creating Minimal Kind Cluster"
     
-    # Delete existing cluster if it exists
+    # Delete existing cluster quickly
     if kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
         print_status "Deleting existing cluster..."
-        kind delete cluster --name ${CLUSTER_NAME}
-        sleep 5
+        kind delete cluster --name ${CLUSTER_NAME} &
+        local delete_pid=$!
+        
+        # Wait max 30 seconds for deletion
+        local delete_timeout=0
+        while kill -0 $delete_pid 2>/dev/null && [[ $delete_timeout -lt 30 ]]; do
+            sleep 1
+            ((delete_timeout++))
+        done
+        
+        if kill -0 $delete_pid 2>/dev/null; then
+            print_warning "Cluster deletion taking too long, forcing..."
+            kill $delete_pid 2>/dev/null || true
+            docker rm -f $(docker ps -aq --filter "label=io.x-k8s.kind.cluster=${CLUSTER_NAME}") 2>/dev/null || true
+        fi
     fi
     
     create_kind_config
     
-    print_status "Creating new single-node Kind cluster..."
-    kind create cluster --config kind-config.yaml --wait 60s
+    print_status "Creating single-node cluster for speed..."
+    if ! kind create cluster --config kind-config.yaml --wait 90s; then
+        capture_error "CLUSTER_CREATION" "Kind cluster creation failed"
+        print_error "Cluster creation failed"
+        exit 1
+    fi
     
-    # Wait for node to be ready
-    print_status "Waiting for node to be ready..."
-    local retries=0
-    while [[ $retries -lt 30 ]]; do
-        if kubectl get nodes | grep -q "Ready"; then
-            print_success "Kind cluster created successfully"
+    # Quick readiness check
+    print_status "Quick cluster readiness check..."
+    local ready_retries=0
+    while [[ $ready_retries -lt 20 ]]; do
+        if kubectl get nodes 2>/dev/null | grep -q "Ready"; then
+            print_success "Cluster is ready"
             return 0
         fi
-        print_status "Waiting for node... (attempt $((retries+1))/30)"
-        sleep 5
-        ((retries++))
+        sleep 3
+        ((ready_retries++))
     done
     
-    print_error "Cluster failed to become ready"
-    kubectl get nodes
-    exit 1
+    print_warning "Cluster not fully ready but continuing..."
 }
 
-# Install Cilium
+# Fast Cilium installation with fallbacks
 install_cilium() {
-    print_header "Installing Cilium CNI"
+    print_header "Installing Cilium CNI (Fast Mode)"
     
-    # Clean up any existing helm repos with retry
-    helm repo remove cilium 2>/dev/null || true
-    
-    local retries=0
-    while [[ $retries -lt 3 ]]; do
-        print_status "Adding Cilium helm repository (attempt $((retries+1))/3)..."
-        if helm repo add cilium https://helm.cilium.io/ && helm repo update; then
+    # Setup helm repo with retry
+    local repo_success=false
+    for attempt in 1 2 3; do
+        print_status "Setting up Cilium repo (attempt $attempt/3)..."
+        if timeout 20s bash -c "helm repo remove cilium 2>/dev/null || true; helm repo add cilium https://helm.cilium.io/ && helm repo update"; then
+            repo_success=true
             break
         fi
-        print_warning "Failed to update helm repos, retrying in 10 seconds..."
-        sleep 10
-        ((retries++))
+        print_warning "Repo setup failed, retrying..."
+        sleep 5
     done
     
-    if [[ $retries -eq 3 ]]; then
-        print_error "Failed to update helm repositories after 3 attempts"
+    if [[ "$repo_success" != "true" ]]; then
+        capture_error "CILIUM_REPO" "Failed to setup Cilium helm repository after 3 attempts"
+        print_error "Cannot setup Cilium repository - check network connectivity"
         exit 1
     fi
     
-    # Uninstall existing Cilium if present
+    # Uninstall existing
     helm uninstall cilium -n kube-system 2>/dev/null || true
-    sleep 5
+    sleep 3
     
-    print_status "Installing Cilium with minimal configuration..."
+    print_status "Installing Cilium with minimal config for speed..."
     
-    # Get the actual API server endpoint from kubectl config
-    local api_server_endpoint=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
-    local api_server_host=$(echo $api_server_endpoint | sed 's|https://||' | cut -d: -f1)
-    local api_server_port=$(echo $api_server_endpoint | sed 's|https://||' | cut -d: -f2)
+    # Get API server info
+    local api_endpoint=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+    local api_host=$(echo $api_endpoint | sed 's|https://||' | cut -d: -f1)
+    local api_port=$(echo $api_endpoint | sed 's|https://||' | cut -d: -f2)
     
-    print_status "Using API server: ${api_server_host}:${api_server_port}"
-    
-    # Install Cilium with shorter timeout and retry logic
-    local install_retries=0
-    while [[ $install_retries -lt 2 ]]; do
-        print_status "Installing Cilium (attempt $((install_retries+1))/2)..."
-        if helm install cilium cilium/cilium \
-            --namespace kube-system \
-            --set kubeProxyReplacement=true \
-            --set k8sServiceHost=${api_server_host} \
-            --set k8sServicePort=${api_server_port} \
-            --set hubble.relay.enabled=true \
-            --set hubble.ui.enabled=true \
-            --set hubble.metrics.enabled="{dns,drop,tcp,flow,port-distribution,icmp,http}" \
-            --set prometheus.enabled=true \
-            --set operator.prometheus.enabled=true \
-            --set hubble.enabled=true \
-            --timeout=120s; then
-            break
-        fi
-        
-        print_warning "Cilium installation failed, cleaning up and retrying..."
-        helm uninstall cilium -n kube-system 2>/dev/null || true
-        sleep 10
-        ((install_retries++))
-    done
-    
-    if [[ $install_retries -eq 2 ]]; then
-        print_error "Failed to install Cilium after 2 attempts"
+    # Fast Cilium installation
+    if helm install cilium cilium/cilium \
+        --namespace kube-system \
+        --set kubeProxyReplacement=true \
+        --set k8sServiceHost=${api_host} \
+        --set k8sServicePort=${api_port} \
+        --set hubble.relay.enabled=true \
+        --set hubble.ui.enabled=true \
+        --set hubble.metrics.enabled="{dns,drop,tcp,flow}" \
+        --set prometheus.enabled=true \
+        --set operator.prometheus.enabled=true \
+        --set hubble.enabled=true \
+        --set operator.replicas=1 \
+        --set hubble.relay.replicas=1 \
+        --timeout=180s; then
+        print_success "Cilium installed"
+    else
+        capture_error "CILIUM_INSTALL" "Helm install failed"
+        print_error "Cilium installation failed"
         exit 1
     fi
     
-    # Wait for Cilium pods with better error handling
-    print_status "Waiting for Cilium to be ready..."
-    
-    # First wait for pods to exist
-    local wait_retries=0
-    while [[ $wait_retries -lt 12 ]]; do
-        if kubectl get pods -n kube-system -l k8s-app=cilium --no-headers 2>/dev/null | grep -q cilium; then
-            break
+    # Async wait for Cilium readiness (don't block)
+    print_status "Cilium initializing in background..."
+    (
+        sleep 30  # Give init containers time
+        if kubectl wait --for=condition=ready pod -l k8s-app=cilium -n kube-system --timeout=240s 2>/dev/null; then
+            CILIUM_READY=true
+            debug_log "Cilium pods are ready"
+        else
+            debug_log "Cilium pods not ready after timeout"
         fi
-        print_status "Waiting for Cilium pods to be created... ($((wait_retries+1))/12)"
-        sleep 10
-        ((wait_retries++))
-    done
+    ) &
     
-    # Wait for Cilium pods to be ready (with longer timeout for init containers)
-    if ! kubectl wait --for=condition=ready pod -l k8s-app=cilium -n kube-system --timeout=300s; then
-        print_warning "Cilium pods not ready yet, checking status..."
-        kubectl get pods -n kube-system -l k8s-app=cilium
-        kubectl describe pods -n kube-system -l k8s-app=cilium | tail -20
-        
-        # Try to restart Cilium pods if they're stuck
-        print_status "Attempting to restart Cilium pods..."
-        kubectl delete pods -n kube-system -l k8s-app=cilium --force --grace-period=0 2>/dev/null || true
-        sleep 30
-        
-        # Wait again after restart
-        kubectl wait --for=condition=ready pod -l k8s-app=cilium -n kube-system --timeout=180s || {
-            print_warning "Cilium still not ready - continuing anyway (may work for basic demo)"
-        }
-    fi
-    
-    # Additional Cilium health checks and fixes
-    print_status "Performing Cilium health checks..."
-    
-    # Check if Cilium operator is running
-    if ! kubectl get pods -n kube-system -l name=cilium-operator --no-headers 2>/dev/null | grep -q Running; then
-        print_status "Waiting for Cilium operator..."
-        kubectl wait --for=condition=ready pod -l name=cilium-operator -n kube-system --timeout=120s || true
-    fi
-    
-    # Check Cilium agent status
-    local cilium_pods=$(kubectl get pods -n kube-system -l k8s-app=cilium --no-headers 2>/dev/null | wc -l)
-    local ready_pods=$(kubectl get pods -n kube-system -l k8s-app=cilium --no-headers 2>/dev/null | grep Running | wc -l)
-    
-    print_status "Cilium status: $ready_pods/$cilium_pods pods ready"
-    
-    if [[ $ready_pods -eq 0 ]]; then
-        print_warning "No Cilium pods ready yet, but continuing with demo setup..."
-        print_status "Cilium may take a few more minutes to initialize on first run"
-    fi
-    
-    print_success "Cilium installation completed"
+    print_success "Cilium installation started"
 }
 
-# Install monitoring stack
+# Lightweight monitoring with fallbacks
 install_monitoring() {
-    print_header "Installing Monitoring Stack"
+    print_header "Installing Monitoring (Optional)"
     
-    # Skip monitoring stack if network issues persist
-    print_status "Installing lightweight monitoring (skipping if network issues)..."
+    if [[ "$NETWORK_ISSUES" == "true" ]]; then
+        print_warning "Skipping monitoring due to network issues"
+        return 0
+    fi
     
-    # Clean up existing repos with timeout
-    helm repo remove prometheus-community 2>/dev/null || true
+    # Quick monitoring setup
+    print_status "Installing minimal Grafana..."
+    kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || true
     
-    # Try to add prometheus repo with timeout
-    local repo_retries=0
-    while [[ $repo_retries -lt 2 ]]; do
-        print_status "Adding Prometheus helm repository (attempt $((repo_retries+1))/2)..."
-        if timeout 30s helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 2>/dev/null && timeout 30s helm repo update 2>/dev/null; then
-            break
-        fi
-        print_warning "Prometheus repo update failed, will skip monitoring stack"
-        ((repo_retries++))
-    done
-    
-    if [[ $repo_retries -eq 2 ]]; then
-        print_warning "Skipping external monitoring stack due to network connectivity issues"
-        print_status "Installing basic monitoring using kubectl manifests..."
-        
-        # Create a simple Grafana deployment without external charts
-        kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
-        
-        cat << EOF | kubectl apply -f -
+    # Simple Grafana deployment (no external charts)
+    cat << EOF | kubectl apply -f - 2>/dev/null || {
+        print_warning "Failed to deploy monitoring - continuing without it"
+        return 0
+    }
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -345,19 +343,27 @@ spec:
     spec:
       containers:
       - name: grafana
-        image: grafana/grafana:latest
+        image: grafana/grafana:10.2.2
         ports:
         - containerPort: 3000
         env:
         - name: GF_SECURITY_ADMIN_PASSWORD
           value: admin
+        - name: GF_USERS_ALLOW_SIGN_UP
+          value: "false"
         resources:
           requests:
-            memory: "64Mi"
-            cpu: "50m"
+            memory: "32Mi"
+            cpu: "25m"
           limits:
-            memory: "128Mi"
+            memory: "64Mi"
             cpu: "100m"
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 5
 ---
 apiVersion: v1
 kind: Service
@@ -371,61 +377,27 @@ spec:
   - port: 3000
     targetPort: 3000
 EOF
-        
-        print_success "Basic monitoring installed"
-        return 0
-    fi
     
-    # Create monitoring namespace
-    kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
-    
-    # Uninstall existing if present
-    helm uninstall prometheus -n monitoring 2>/dev/null || true
-    sleep 5
-    
-    # Install lightweight Prometheus with shorter timeout
-    print_status "Installing lightweight Prometheus stack..."
-    if ! helm install prometheus prometheus-community/kube-prometheus-stack \
-        --namespace monitoring \
-        --set prometheus.prometheusSpec.retention=15m \
-        --set prometheus.prometheusSpec.resources.requests.memory=128Mi \
-        --set prometheus.prometheusSpec.resources.requests.cpu=50m \
-        --set alertmanager.enabled=false \
-        --set grafana.adminPassword=admin \
-        --set grafana.persistence.enabled=false \
-        --set grafana.resources.requests.memory=32Mi \
-        --set grafana.resources.requests.cpu=25m \
-        --set nodeExporter.enabled=false \
-        --set kubeStateMetrics.enabled=false \
-        --set prometheusOperator.resources.requests.memory=64Mi \
-        --set prometheusOperator.resources.requests.cpu=25m \
-        --timeout=120s 2>/dev/null; then
-        print_warning "Monitoring stack installation failed - continuing without it"
-        return 0
-    fi
-    
-    print_success "Monitoring stack installed successfully"
+    MONITORING_READY=true
+    print_success "Basic monitoring installed"
 }
 
-# Deploy demo application
+# Ultra-lightweight demo application
 deploy_demo_app() {
-    print_header "Deploying Demo Application"
+    print_header "Deploying Ultra-Light Demo App"
     
-    # Create demo namespace
     kubectl create namespace ${DEMO_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
     
-    print_status "Deploying lightweight demo application..."
+    print_status "Deploying minimal demo application..."
     cat << EOF | kubectl apply -f -
-# Backend API
+# Backend API (single pod)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: backend
   namespace: ${DEMO_NAMESPACE}
-  labels:
-    app: backend
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: backend
@@ -441,15 +413,21 @@ spec:
         - containerPort: 80
         resources:
           requests:
-            memory: "16Mi"
-            cpu: "10m"
+            memory: "8Mi"
+            cpu: "5m"
           limits:
-            memory: "32Mi"
-            cpu: "50m"
+            memory: "16Mi"
+            cpu: "25m"
         volumeMounts:
         - name: config
           mountPath: /etc/nginx/conf.d/default.conf
           subPath: default.conf
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 3
       volumes:
       - name: config
         configMap:
@@ -465,11 +443,15 @@ data:
     server {
         listen 80;
         location /api/health {
-            return 200 '{"status":"healthy","service":"backend","timestamp":"$(date -Iseconds)"}';
+            return 200 '{"status":"healthy","service":"backend","pod":"'"\$hostname"'","timestamp":"'"\$(date -Iseconds)"'"}';
             add_header Content-Type application/json;
         }
         location /api/users {
-            return 200 '[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]';
+            return 200 '[{"id":1,"name":"Alice","status":"active"},{"id":2,"name":"Bob","status":"active"}]';
+            add_header Content-Type application/json;
+        }
+        location /api/metrics {
+            return 200 '{"requests":'"\$((RANDOM % 1000 + 100))"',"errors":'"\$((RANDOM % 10))"',"uptime":"'"\$(uptime -p)"'"}';
             add_header Content-Type application/json;
         }
     }
@@ -486,14 +468,12 @@ spec:
   - port: 80
     targetPort: 80
 ---
-# Frontend
+# Frontend (single pod)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: frontend
   namespace: ${DEMO_NAMESPACE}
-  labels:
-    app: frontend
 spec:
   replicas: 1
   selector:
@@ -511,19 +491,52 @@ spec:
         - containerPort: 80
         resources:
           requests:
-            memory: "16Mi"
-            cpu: "10m"
+            memory: "8Mi"
+            cpu: "5m"
           limits:
-            memory: "32Mi"
-            cpu: "50m"
+            memory: "16Mi"
+            cpu: "25m"
         volumeMounts:
         - name: html
           mountPath: /usr/share/nginx/html/index.html
           subPath: index.html
+        - name: nginx-config
+          mountPath: /etc/nginx/conf.d/default.conf
+          subPath: default.conf
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 3
       volumes:
       - name: html
         configMap:
           name: frontend-html
+      - name: nginx-config
+        configMap:
+          name: frontend-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  namespace: ${DEMO_NAMESPACE}
+data:
+  default.conf: |
+    server {
+        listen 80;
+        location / {
+            try_files \$uri \$uri/ /index.html;
+        }
+        location /api/ {
+            proxy_pass http://backend/;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_connect_timeout 5s;
+            proxy_read_timeout 10s;
+        }
+    }
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -533,35 +546,157 @@ metadata:
 data:
   index.html: |
     <!DOCTYPE html>
-    <html>
+    <html lang="en">
     <head>
-        <title>Cilium Demo App</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>🐝 Cilium Demo</title>
         <style>
-            body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
-            .container { max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; }
-            .header { text-align: center; color: #2c3e50; margin-bottom: 30px; }
-            .card { background: #ecf0f1; padding: 20px; margin: 15px 0; border-radius: 5px; }
-            .button { background: #3498db; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; }
-            .status { color: #27ae60; font-weight: bold; }
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }
+            .container { max-width: 800px; margin: 0 auto; background: white; border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); overflow: hidden; }
+            .header { background: linear-gradient(135deg, #4f46e5, #7c3aed); color: white; padding: 30px; text-align: center; }
+            .header h1 { font-size: 2.5em; margin-bottom: 10px; }
+            .header p { opacity: 0.9; font-size: 1.1em; }
+            .content { padding: 30px; }
+            .card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 20px; margin: 20px 0; }
+            .card h3 { color: #1e293b; margin-bottom: 15px; }
+            .status { display: inline-block; padding: 8px 16px; border-radius: 20px; font-weight: bold; }
+            .healthy { background: #10b981; color: white; }
+            .loading { background: #f59e0b; color: white; }
+            .button { background: #4f46e5; color: white; padding: 12px 24px; border: none; border-radius: 8px; cursor: pointer; margin: 5px; font-weight: 500; transition: all 0.2s; }
+            .button:hover { background: #4338ca; transform: translateY(-1px); }
+            .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+            .metric { background: #eff6ff; padding: 15px; border-radius: 8px; text-align: center; }
+            .metric-value { font-size: 2em; font-weight: bold; color: #1d4ed8; }
+            .metric-label { color: #64748b; margin-top: 5px; }
+            #output { background: #1e293b; color: #e2e8f0; padding: 15px; border-radius: 8px; font-family: 'Monaco', 'Consolas', monospace; font-size: 0.9em; max-height: 200px; overflow-y: auto; }
         </style>
     </head>
     <body>
         <div class="container">
             <div class="header">
-                <h1>🐝 Cilium Demo Application</h1>
-                <p>Showcasing Kubernetes networking with Cilium CNI</p>
+                <h1>🐝 Cilium Network Demo</h1>
+                <p>eBPF-powered Kubernetes networking in action</p>
             </div>
-            <div class="card">
-                <h3>Backend Status</h3>
-                <p class="status">✅ Backend is running and healthy!</p>
-                <p>This demo showcases:</p>
-                <ul>
-                    <li>🔍 <strong>Hubble:</strong> Network flow monitoring</li>
-                    <li>📊 <strong>Grafana:</strong> Metrics visualization</li>
-                    <li>⚡ <strong>Cilium:</strong> eBPF networking</li>
-                </ul>
+            <div class="content">
+                <div class="card">
+                    <h3>🚀 System Status</h3>
+                    <span id="status" class="status loading">Initializing...</span>
+                    <button class="button" onclick="checkStatus()">Refresh Status</button>
+                    <button class="button" onclick="runTests()">Run Network Tests</button>
+                </div>
+                
+                <div class="grid">
+                    <div class="card">
+                        <h3>📊 Live Metrics</h3>
+                        <div class="metric">
+                            <div id="requests" class="metric-value">-</div>
+                            <div class="metric-label">API Requests</div>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h3>👥 User Data</h3>
+                        <div id="users">Loading...</div>
+                        <button class="button" onclick="loadUsers()">Fetch Users</button>
+                    </div>
+                </div>
+                
+                <div class="card">
+                    <h3>🔍 Network Observability</h3>
+                    <p><strong>Cilium Features Demonstrated:</strong></p>
+                    <ul style="margin: 10px 0; padding-left: 20px;">
+                        <li>🌐 eBPF-based networking and load balancing</li>
+                        <li>🔒 Network policy enforcement</li>
+                        <li>📈 Real-time flow monitoring with Hubble</li>
+                        <li>⚡ High-performance packet processing</li>
+                    </ul>
+                </div>
+                
+                <div class="card">
+                    <h3>🖥️ Test Output</h3>
+                    <div id="output">Ready for network tests...</div>
+                </div>
             </div>
         </div>
+        
+        <script>
+            let testCount = 0;
+            
+            async function checkStatus() {
+                try {
+                    const response = await fetch('/api/health');
+                    const data = await response.json();
+                    document.getElementById('status').textContent = \`✅ \${data.service} healthy (Pod: \${data.pod})\`;
+                    document.getElementById('status').className = 'status healthy';
+                    return true;
+                } catch (error) {
+                    document.getElementById('status').textContent = '❌ Backend unavailable';
+                    document.getElementById('status').className = 'status loading';
+                    return false;
+                }
+            }
+            
+            async function loadUsers() {
+                try {
+                    const response = await fetch('/api/users');
+                    const users = await response.json();
+                    document.getElementById('users').innerHTML = users.map(u => 
+                        \`<div style="padding: 5px; border-left: 3px solid #4f46e5; margin: 5px 0; background: white; border-radius: 3px;">👤 \${u.name} (ID: \${u.id}) - \${u.status}</div>\`
+                    ).join('');
+                } catch (error) {
+                    document.getElementById('users').innerHTML = '<div style="color: #ef4444;">Failed to load users</div>';
+                }
+            }
+            
+            async function updateMetrics() {
+                try {
+                    const response = await fetch('/api/metrics');
+                    const metrics = await response.json();
+                    document.getElementById('requests').textContent = metrics.requests;
+                } catch (error) {
+                    document.getElementById('requests').textContent = 'Error';
+                }
+            }
+            
+            async function runTests() {
+                const output = document.getElementById('output');
+                output.innerHTML = 'Running network tests...<br>';
+                
+                testCount++;
+                const tests = [
+                    { name: 'Backend Health', url: '/api/health' },
+                    { name: 'User API', url: '/api/users' },
+                    { name: 'Metrics API', url: '/api/metrics' }
+                ];
+                
+                for (const test of tests) {
+                    try {
+                        const start = Date.now();
+                        const response = await fetch(test.url);
+                        const duration = Date.now() - start;
+                        const status = response.ok ? '✅' : '❌';
+                        output.innerHTML += \`\${status} \${test.name}: \${duration}ms<br>\`;
+                    } catch (error) {
+                        output.innerHTML += \`❌ \${test.name}: Failed<br>\`;
+                    }
+                }
+                
+                output.innerHTML += \`<br>Test run #\${testCount} completed at \${new Date().toLocaleTimeString()}<br>\`;
+                output.scrollTop = output.scrollHeight;
+            }
+            
+            // Auto-refresh
+            setInterval(checkStatus, 10000);
+            setInterval(updateMetrics, 5000);
+            
+            // Initial load
+            setTimeout(() => {
+                checkStatus();
+                loadUsers();
+                updateMetrics();
+            }, 1000);
+        </script>
     </body>
     </html>
 ---
@@ -576,22 +711,24 @@ spec:
   ports:
   - port: 80
     targetPort: 80
-  type: NodePort
-  
 EOF
 
-    # Wait for deployments
-    print_status "Waiting for demo app to be ready..."
-    kubectl wait --for=condition=available deployment/frontend -n ${DEMO_NAMESPACE} --timeout=120s
-    kubectl wait --for=condition=available deployment/backend -n ${DEMO_NAMESPACE} --timeout=120s
-    
-    print_success "Demo application deployed"
+    # Quick wait for deployments
+    print_status "Waiting for demo app (30s timeout)..."
+    if kubectl wait --for=condition=available deployment/frontend -n ${DEMO_NAMESPACE} --timeout=30s && \
+       kubectl wait --for=condition=available deployment/backend -n ${DEMO_NAMESPACE} --timeout=30s; then
+        DEMO_APP_READY=true
+        print_success "Demo application ready"
+    else
+        print_warning "Demo app deployment slow - continuing anyway"
+        DEMO_APP_READY=false
+    fi
 }
 
-# Generate sample load
+# Minimal load generator
 generate_load() {
-    print_status "Starting load generator..."
-    cat << EOF | kubectl apply -f -
+    print_status "Starting lightweight load generator..."
+    cat << EOF | kubectl apply -f - 2>/dev/null || true
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -618,27 +755,30 @@ spec:
             curl -s http://backend/api/health > /dev/null || true
             curl -s http://backend/api/users > /dev/null || true
             curl -s http://frontend/ > /dev/null || true
-            sleep 3
+            sleep 5
           done
         resources:
           requests:
-            memory: "8Mi"
-            cpu: "5m"
+            memory: "4Mi"
+            cpu: "2m"
           limits:
-            memory: "16Mi"
-            cpu: "20m"
+            memory: "8Mi"
+            cpu: "10m"
 EOF
     print_success "Load generator started"
 }
 
-# Apply network policies for demo
+# Apply minimal network policies
 apply_network_policies() {
-    print_status "Applying Cilium network policies..."
-    cat << EOF | kubectl apply -f -
+    print_status "Applying network policies..."
+    cat << EOF | kubectl apply -f - 2>/dev/null || {
+        print_warning "Network policies failed - Cilium may not be ready yet"
+        return 0
+    }
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
-  name: demo-policy
+  name: demo-backend-policy
   namespace: ${DEMO_NAMESPACE}
 spec:
   endpointSelector:
@@ -650,144 +790,217 @@ spec:
         app: frontend
     - matchLabels:
         app: load-generator
-    toPorts:
-    - ports:
-      - port: "80"
-        protocol: TCP
 EOF
     print_success "Network policies applied"
 }
 
-# Setup port forwards
+# Fast port forward setup
 setup_port_forwards() {
-    print_header "Setting up Port Forwards"
+    print_header "Setting up Access Points"
     
-    # Kill any existing port forwards
+    # Kill existing port forwards
     pkill -f "kubectl port-forward" 2>/dev/null || true
     sleep 2
     
-    # Setup Hubble UI
-    print_status "Setting up Hubble UI port forward..."
-    kubectl port-forward -n kube-system svc/hubble-ui 12000:80 > /dev/null 2>&1 &
-    HUBBLE_PID=$!
+    local pf_pids=()
     
-    # Setup Grafana (check both prometheus-grafana and basic grafana)
-    if kubectl get svc prometheus-grafana -n monitoring &>/dev/null; then
-        print_status "Setting up Prometheus Grafana port forward..."
-        kubectl port-forward -n monitoring svc/prometheus-grafana 13000:80 > /dev/null 2>&1 &
-        GRAFANA_PID=$!
-    elif kubectl get svc grafana -n monitoring &>/dev/null; then
-        print_status "Setting up basic Grafana port forward..."
-        kubectl port-forward -n monitoring svc/grafana 13000:3000 > /dev/null 2>&1 &
-        GRAFANA_PID=$!
-    else
-        print_warning "Grafana not available - skipping port forward"
-        GRAFANA_PID=""
+    # Demo app (priority)
+    if [[ "$DEMO_APP_READY" == "true" ]] || kubectl get svc frontend -n ${DEMO_NAMESPACE} &>/dev/null; then
+        print_status "Setting up demo app access..."
+        kubectl port-forward -n ${DEMO_NAMESPACE} svc/frontend 18080:80 > /dev/null 2>&1 &
+        pf_pids+=($!)
     fi
     
-    # Setup demo app
-    print_status "Setting up demo app port forward..."
-    kubectl port-forward -n ${DEMO_NAMESPACE} svc/frontend 18080:80 > /dev/null 2>&1 &
-    DEMO_PID=$!
+    # Hubble UI (if available)
+    if kubectl get svc hubble-ui -n kube-system &>/dev/null; then
+        print_status "Setting up Hubble UI access..."
+        kubectl port-forward -n kube-system svc/hubble-ui 12000:80 > /dev/null 2>&1 &
+        pf_pids+=($!)
+    fi
+    
+    # Grafana (if available)
+    if kubectl get svc grafana -n monitoring &>/dev/null; then
+        print_status "Setting up Grafana access..."
+        kubectl port-forward -n monitoring svc/grafana 13000:3000 > /dev/null 2>&1 &
+        pf_pids+=($!)
+    elif kubectl get svc prometheus-grafana -n monitoring &>/dev/null; then
+        print_status "Setting up Prometheus Grafana access..."
+        kubectl port-forward -n monitoring svc/prometheus-grafana 13000:80 > /dev/null 2>&1 &
+        pf_pids+=($!)
+    fi
+    
+    # Store PIDs for cleanup
+    export PORT_FORWARD_PIDS="${pf_pids[*]}"
     
     sleep 3
     print_success "Port forwards established"
 }
 
-# Display dashboard information
-display_dashboards() {
-    print_header "🚀 Demo Environment Ready!"
+# Comprehensive status check
+check_final_status() {
+    print_header "🔍 Final System Status"
     
-    echo ""
-    print_success "Cluster Information:"
-    echo "  • Cluster Name: ${CLUSTER_NAME}"
-    echo "  • Architecture: $(detect_arch)"
-    echo "  • Nodes: $(kubectl get nodes --no-headers | wc -l)"
+    # Cluster status
+    local nodes_ready=$(kubectl get nodes --no-headers 2>/dev/null | grep Ready | wc -l)
+    print_status "Cluster: $nodes_ready nodes ready"
     
-    echo ""
-    print_success "📊 Dashboard URLs:"
-    echo "  • Demo Application:  http://localhost:18080"
-    echo "  • Hubble UI:         http://localhost:12000"
-    if [[ ! -z "$GRAFANA_PID" ]]; then
-        echo "  • Grafana:           http://localhost:13000 (admin/admin)"
+    # Cilium status
+    local cilium_pods=$(kubectl get pods -n kube-system -l k8s-app=cilium --no-headers 2>/dev/null | wc -l)
+    local cilium_ready=$(kubectl get pods -n kube-system -l k8s-app=cilium --no-headers 2>/dev/null | grep Running | wc -l)
+    print_status "Cilium: $cilium_ready/$cilium_pods pods running"
+    
+    # Hubble status
+    if kubectl get pods -n kube-system -l k8s-app=hubble-ui --no-headers 2>/dev/null | grep -q Running; then
+        print_status "Hubble UI: ✅ Running"
     else
-        echo "  • Grafana:           Not available (network issues during installation)"
+        print_status "Hubble UI: ⏳ Starting"
     fi
     
-    echo ""
-    print_success "🔍 Useful Commands:"
-    echo "  • View network flows: kubectl exec -n kube-system ds/cilium -- hubble observe"
-    echo "  • Check Cilium status: kubectl exec -n kube-system ds/cilium -- cilium status"
-    echo "  • View demo pods: kubectl get pods -n ${DEMO_NAMESPACE}"
+    # Demo app status
+    local demo_pods=$(kubectl get pods -n ${DEMO_NAMESPACE} --no-headers 2>/dev/null | wc -l)
+    local demo_ready=$(kubectl get pods -n ${DEMO_NAMESPACE} --no-headers 2>/dev/null | grep Running | wc -l)
+    print_status "Demo App: $demo_ready/$demo_pods pods running"
+    
+    # Monitoring status
+    if kubectl get pods -n monitoring --no-headers 2>/dev/null | grep -q Running; then
+        print_status "Monitoring: ✅ Available"
+    else
+        print_status "Monitoring: ❌ Not available"
+    fi
+}
+
+# Enhanced dashboard display
+display_dashboards() {
+    local end_time=$(date +%s)
+    local duration=$((end_time - START_TIME))
+    
+    print_header "🚀 Demo Environment Ready!"
+    
+    print_success "Setup completed in ${duration} seconds"
     
     echo ""
-    print_success "🧪 Demo Features:"
-    echo "  • ✅ Single-node Kind cluster (fast startup)"
-    echo "  • ✅ Cilium CNI with eBPF networking"
-    echo "  • ✅ Hubble for network observability"
-    echo "  • ✅ Grafana dashboards"
-    echo "  • ✅ Lightweight demo application"
-    echo "  • ✅ Automated load generation"
+    print_success "📊 Available Dashboards:"
+    
+    # Check what's actually available
+    local available_services=()
+    
+    if kubectl get svc frontend -n ${DEMO_NAMESPACE} &>/dev/null; then
+        available_services+=("Demo Application: http://localhost:18080")
+    fi
+    
+    if kubectl get svc hubble-ui -n kube-system &>/dev/null; then
+        available_services+=("Hubble UI: http://localhost:12000")
+    fi
+    
+    if kubectl get svc grafana -n monitoring &>/dev/null || kubectl get svc prometheus-grafana -n monitoring &>/dev/null; then
+        available_services+=("Grafana: http://localhost:13000 (admin/admin)")
+    fi
+    
+    for service in "${available_services[@]}"; do
+        echo "  • $service"
+    done
     
     echo ""
-    print_warning "🛑 To cleanup: kind delete cluster --name ${CLUSTER_NAME}"
+    check_final_status
     
     echo ""
-    print_status "Port forwards are running in the background..."
-    print_status "Press Ctrl+C to stop all port forwards and exit"
+    print_success "🔍 Debug Commands:"
+    echo "  • View debug log: cat $DEBUG_LOG"
+    echo "  • Cilium status: kubectl exec -n kube-system ds/cilium -- cilium status"
+    echo "  • Network flows: kubectl exec -n kube-system ds/cilium -- hubble observe"
+    echo "  • All pods: kubectl get pods --all-namespaces"
     
-    # Wait for interrupt
-    trap 'cleanup' INT
+    echo ""
+    print_success "🧪 Demo Features Working:"
+    [[ ${#available_services[@]} -gt 0 ]] && echo "  • ✅ Web interfaces available"
+    [[ $cilium_ready -gt 0 ]] && echo "  • ✅ Cilium networking active"
+    kubectl get pods -n ${DEMO_NAMESPACE} --no-headers 2>/dev/null | grep -q Running && echo "  • ✅ Demo application running"
+    kubectl get ciliumnetworkpolicy -n ${DEMO_NAMESPACE} &>/dev/null && echo "  • ✅ Network policies active"
+    
+    echo ""
+    print_warning "🛑 Cleanup: kind delete cluster --name ${CLUSTER_NAME}"
+    
+    echo ""
+    print_status "Port forwards running in background. Press Ctrl+C to exit."
+    
+    # Keep running
+    trap 'cleanup' INT TERM
+    
+    # Background health monitoring
+    (
+        while true; do
+            sleep 30
+            debug_log "Health check: $(kubectl get pods --all-namespaces --no-headers 2>/dev/null | grep -c Running) pods running"
+        done
+    ) &
+    
     wait
 }
 
-# Cleanup function
+# Enhanced cleanup
 cleanup() {
     print_header "Cleaning up..."
     
-    # Kill port forwards
-    [[ ! -z "$HUBBLE_PID" ]] && kill $HUBBLE_PID 2>/dev/null || true
-    [[ ! -z "$GRAFANA_PID" && "$GRAFANA_PID" != "" ]] && kill $GRAFANA_PID 2>/dev/null || true
-    [[ ! -z "$DEMO_PID" ]] && kill $DEMO_PID 2>/dev/null || true
+    # Kill all port forwards
+    if [[ ! -z "$PORT_FORWARD_PIDS" ]]; then
+        for pid in $PORT_FORWARD_PIDS; do
+            kill $pid 2>/dev/null || true
+        done
+    fi
     
-    # Kill any remaining port forwards
     pkill -f "kubectl port-forward" 2>/dev/null || true
     
-    # Clean up temporary files
+    # Clean up files
     rm -f kind-config.yaml
     
+    print_status "Debug log saved to: $DEBUG_LOG"
     print_success "Cleanup completed"
     exit 0
 }
 
-# Main execution
+# Main execution with comprehensive error handling
 main() {
-    print_header "🐝 Cilium Kubernetes Demo Setup"
-    echo "This script will create a lightweight Kubernetes demo environment with:"
-    echo "• Single-node Kind cluster with Cilium CNI"
-    echo "• Hubble for network observability"
-    echo "• Grafana monitoring"
-    echo "• Demo application with load generation"
+    # Setup debugging first
+    setup_debug
+    
+    print_header "🐝 Cilium Demo - Ultra-Fast Setup"
+    echo "Target: Complete setup in under 10 minutes"
+    echo "Features: Cilium + Hubble + Demo App + Monitoring"
     echo ""
     
     local arch=$(detect_arch)
-    print_status "Detected architecture: $arch"
+    print_status "Architecture: $arch"
+    debug_log "Starting demo setup for $arch"
     
-    check_dependencies
-    create_cluster
-    install_cilium
+    # Execute with error handling
+    set +e  # Don't exit on errors, handle them gracefully
     
-    # Continue with demo app even if monitoring fails
+    check_dependencies || {
+        capture_error "DEPENDENCIES" "Dependency check failed"
+        exit 1
+    }
+    
+    create_cluster || {
+        capture_error "CLUSTER" "Cluster creation failed"
+        exit 1
+    }
+    
+    install_cilium || {
+        capture_error "CILIUM" "Cilium installation failed"
+        exit 1
+    }
+    
+    # Continue with demo app regardless of Cilium readiness
     deploy_demo_app
     generate_load
     apply_network_policies
     
-    # Try monitoring installation (may fail due to network issues)
+    # Optional monitoring
     install_monitoring
     
-    # Wait a bit for everything to settle
-    print_status "Waiting for all components to be ready..."
-    sleep 20
+    # Final setup
+    print_status "Finalizing setup..."
+    sleep 10
     
     setup_port_forwards
     display_dashboards
