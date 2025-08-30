@@ -121,6 +121,20 @@ nodes:
     nodeRegistration:
       kubeletExtraArgs:
         node-labels: "ingress-ready=true"
+        system-reserved: "cpu=100m,memory=100Mi"
+        kube-reserved: "cpu=100m,memory=100Mi"
+        eviction-hard: "memory.available<50Mi"
+  - |
+    kind: ClusterConfiguration
+    etcd:
+      local:
+        dataDir: /var/lib/etcd
+        extraArgs:
+          quota-backend-bytes: "2147483648"
+    apiServer:
+      extraArgs:
+        enable-admission-plugins: "NodeRestriction"
+        disable-admission-plugins: "StorageObjectInUseProtection"
   extraPortMappings:
   - containerPort: 80
     hostPort: 8080
@@ -130,11 +144,19 @@ nodes:
     protocol: TCP
 - role: worker
   image: kindest/node:v1.29.0
-- role: worker
-  image: kindest/node:v1.29.0
+  kubeadmConfigPatches:
+  - |
+    kind: JoinConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        system-reserved: "cpu=100m,memory=100Mi"
+        kube-reserved: "cpu=100m,memory=100Mi"
+        eviction-hard: "memory.available<50Mi"
 networking:
   disableDefaultCNI: true
   kubeProxyMode: "none"
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/16"
 EOF
 }
 
@@ -146,42 +168,79 @@ create_cluster() {
     if kind get clusters | grep -q "^${CLUSTER_NAME}$"; then
         print_status "Deleting existing cluster..."
         kind delete cluster --name ${CLUSTER_NAME}
+        sleep 5  # Give time for cleanup
     fi
     
     local arch=$(detect_arch)
     create_kind_config $arch
     
     print_status "Creating new Kind cluster..."
-    kind create cluster --config kind-config.yaml --wait 300s
+    kind create cluster --config kind-config.yaml --wait 120s
     
-    # Set kubectl context
+    # Additional wait for cluster to be fully ready
+    print_status "Waiting for cluster nodes to be ready..."
+    kubectl wait --for=condition=Ready nodes --all --timeout=300s
+    
+    # Verify cluster is working
     kubectl cluster-info --context kind-${CLUSTER_NAME}
-    print_success "Kind cluster created successfully"
+    
+    # Wait for kube-system pods to be ready
+    print_status "Waiting for core system pods..."
+    kubectl wait --for=condition=Ready pods --all -n kube-system --timeout=300s || true
+    
+    # Final cluster health check
+    print_status "Performing final cluster health check..."
+    local retries=0
+    while [[ $retries -lt 10 ]]; do
+        if kubectl get nodes | grep -q "Ready"; then
+            print_success "Kind cluster created successfully"
+            return 0
+        fi
+        print_status "Waiting for cluster to be ready... (attempt $((retries+1))/10)"
+        sleep 10
+        ((retries++))
+    done
+    
+    print_error "Cluster failed to become ready after 100 seconds"
+    exit 1
 }
 
 # Install Cilium
 install_cilium() {
     print_header "Installing Cilium CNI"
     
-    # Add Cilium Helm repository
+    # Add Cilium Helm repository (remove if exists)
+    helm repo remove cilium 2>/dev/null || true
     helm repo add cilium https://helm.cilium.io/
     helm repo update
     
+    # Check if Cilium is already installed
+    if helm list -n kube-system | grep -q cilium; then
+        print_status "Cilium already installed, upgrading..."
+        helm uninstall cilium -n kube-system || true
+        sleep 10
+    fi
+    
     # Install Cilium with optimized settings for demo
     print_status "Installing Cilium..."
+    
+    # Get the correct API server endpoint
+    local api_server=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' | sed 's|https://||' | cut -d: -f1)
+    local api_port=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' | sed 's|https://||' | cut -d: -f2)
+    
     helm install cilium cilium/cilium \
         --namespace kube-system \
         --set kubeProxyReplacement=strict \
-        --set k8sServiceHost=127.0.0.1 \
-        --set k8sServicePort=6443 \
+        --set k8sServiceHost=${api_server} \
+        --set k8sServicePort=${api_port} \
         --set hubble.relay.enabled=true \
         --set hubble.ui.enabled=true \
         --set hubble.metrics.enabled="{dns,drop,tcp,flow,port-distribution,icmp,http}" \
         --set prometheus.enabled=true \
         --set operator.prometheus.enabled=true \
         --set hubble.enabled=true \
-        --set hubble.metrics.enabled=true \
-        --wait
+        --set ipam.mode=kubernetes \
+        --wait --timeout=600s
     
     # Wait for Cilium to be ready
     print_status "Waiting for Cilium to be ready..."
@@ -194,13 +253,22 @@ install_cilium() {
 install_monitoring() {
     print_header "Installing Monitoring Stack"
     
-    # Add Prometheus community Helm repository
+    # Add Prometheus community Helm repository (remove if exists)
+    helm repo remove prometheus-community 2>/dev/null || true
+    helm repo remove grafana 2>/dev/null || true
     helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
     helm repo add grafana https://grafana.github.io/helm-charts
     helm repo update
     
     # Create monitoring namespace
     kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+    
+    # Check if Prometheus is already installed
+    if helm list -n monitoring | grep -q prometheus; then
+        print_status "Prometheus already installed, upgrading..."
+        helm uninstall prometheus -n monitoring || true
+        sleep 10
+    fi
     
     # Install Prometheus
     print_status "Installing Prometheus..."
@@ -209,11 +277,15 @@ install_monitoring() {
         --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
         --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false \
         --set prometheus.prometheusSpec.retention=1h \
-        --set prometheus.prometheusSpec.storageSpec.volumeClaimTemplate.spec.resources.requests.storage=2Gi \
+        --set prometheus.prometheusSpec.storageSpec.volumeClaimTemplate.spec.resources.requests.storage=1Gi \
         --set alertmanager.enabled=false \
         --set grafana.adminPassword=admin \
         --set grafana.persistence.enabled=false \
-        --wait
+        --set grafana.resources.requests.memory=128Mi \
+        --set grafana.resources.requests.cpu=100m \
+        --set prometheus.prometheusSpec.resources.requests.memory=512Mi \
+        --set prometheus.prometheusSpec.resources.requests.cpu=200m \
+        --wait --timeout=600s
     
     print_success "Monitoring stack installed successfully"
 }
