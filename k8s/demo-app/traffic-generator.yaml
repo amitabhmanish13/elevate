@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-generator
+  namespace: demo
+  labels:
+    app: traffic-generator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traffic-generator
+  template:
+    metadata:
+      labels:
+        app: traffic-generator
+    spec:
+      containers:
+      - name: traffic-generator
+        image: curlimages/curl:latest
+        command: ["/bin/sh"]
+        args:
+          - -c
+          - |
+            echo "🚀 Starting traffic generator for Cilium demo..."
+            while true; do
+              # Normal API calls
+              curl -s http://backend:8080/health > /dev/null
+              curl -s http://backend:8080/api/v1/users > /dev/null
+              curl -s http://backend:8080/api/v1/tasks > /dev/null
+              
+              # Slow endpoint (for latency metrics)
+              curl -s http://backend:8080/api/v1/demo/slow > /dev/null
+              
+              # Error endpoint (for error rate metrics)
+              curl -s http://backend:8080/api/v1/demo/error > /dev/null
+              
+              # External call (for egress traffic)
+              curl -s http://backend:8080/api/v1/demo/external > /dev/null
+              
+              # Frontend calls
+              curl -s http://frontend > /dev/null
+              
+              echo "Traffic generated at $(date)"
+              sleep 10
+            done
+        resources:
+          requests:
+            memory: "16Mi"
+            cpu: "10m"
+          limits:
+            memory: "32Mi"
+            cpu: "20m"

@@ -1,0 +1,128 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "Cilium Network Overview",
+    "tags": ["cilium", "network", "observability"],
+    "style": "dark",
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Network Flows",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "sum(rate(cilium_flows_total[5m]))",
+            "legendFormat": "Flows/sec"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "thresholds"
+            },
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "yellow", "value": 100},
+                {"color": "red", "value": 1000}
+              ]
+            }
+          }
+        },
+        "gridPos": {"h": 8, "w": 6, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "Policy Drops",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "sum(rate(cilium_drop_count_total[5m]))",
+            "legendFormat": "Drops/sec"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {
+              "mode": "thresholds"
+            },
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "yellow", "value": 1},
+                {"color": "red", "value": 10}
+              ]
+            }
+          }
+        },
+        "gridPos": {"h": 8, "w": 6, "x": 6, "y": 0}
+      },
+      {
+        "id": 3,
+        "title": "Active Endpoints",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "cilium_endpoint_count",
+            "legendFormat": "Endpoints"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 6, "x": 12, "y": 0}
+      },
+      {
+        "id": 4,
+        "title": "Network Policies",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "cilium_policy_count",
+            "legendFormat": "Policies"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 6, "x": 18, "y": 0}
+      },
+      {
+        "id": 5,
+        "title": "Network Flow Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(cilium_flows_total[5m])",
+            "legendFormat": "{{direction}} flows"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+      },
+      {
+        "id": 6,
+        "title": "Policy Enforcement",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(cilium_policy_verdict_total[5m])",
+            "legendFormat": "{{verdict}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+      },
+      {
+        "id": 7,
+        "title": "Top Talkers by Namespace",
+        "type": "table",
+        "targets": [
+          {
+            "expr": "topk(10, sum by (source_namespace, destination_namespace) (rate(cilium_flows_total[5m])))",
+            "format": "table"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16}
+      }
+    ],
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "refresh": "5s"
+  }
+}

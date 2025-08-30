@@ -1,0 +1,59 @@
+# Cilium Configuration with Hubble enabled
+hubble:
+  enabled: true
+  relay:
+    enabled: true
+  ui:
+    enabled: true
+    service:
+      type: NodePort
+      nodePort: 32001
+  metrics:
+    enabled:
+      - dns:query;ignoreAAAA
+      - drop
+      - tcp
+      - flow
+      - icmp
+      - http
+    serviceMonitor:
+      enabled: true
+
+# Enable Prometheus metrics
+prometheus:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+
+# Enable network policies
+policyEnforcementMode: default
+
+# Enable L7 proxy for HTTP visibility
+l7Proxy: true
+
+# Enable operator metrics
+operator:
+  prometheus:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+
+# Enable cluster mesh for multi-cluster visibility
+cluster:
+  name: demo-cluster
+  id: 1
+
+# Enable bandwidth manager
+bandwidthManager:
+  enabled: true
+
+# Enable local redirect policy
+localRedirectPolicy: true
+
+# Enable host firewall
+hostFirewall:
+  enabled: true
+
+# Enable socket level load balancing
+socketLB:
+  enabled: true
