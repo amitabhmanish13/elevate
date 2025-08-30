@@ -23,6 +23,38 @@ MONITORING_READY=false
 DEMO_APP_READY=false
 NETWORK_ISSUES=false
 
+# macOS compatible timeout function
+run_with_timeout() {
+    local timeout_duration=$1
+    shift
+    local command=("$@")
+    
+    # If timeout command is available, use it
+    if command -v timeout &> /dev/null; then
+        timeout "${timeout_duration}s" "${command[@]}"
+        return $?
+    fi
+    
+    # Fallback for macOS without coreutils
+    "${command[@]}" &
+    local cmd_pid=$!
+    
+    local wait_time=0
+    while kill -0 $cmd_pid 2>/dev/null && [[ $wait_time -lt $timeout_duration ]]; do
+        sleep 1
+        ((wait_time++))
+    done
+    
+    if kill -0 $cmd_pid 2>/dev/null; then
+        kill $cmd_pid 2>/dev/null || true
+        wait $cmd_pid 2>/dev/null || true
+        return 124  # timeout exit code
+    else
+        wait $cmd_pid
+        return $?
+    fi
+}
+
 # Debug and logging functions
 setup_debug() {
     # Create debug log
@@ -133,6 +165,14 @@ check_dependencies() {
         exit 1
     fi
     
+    # Install coreutils for timeout command if not available
+    if ! command -v timeout &> /dev/null; then
+        print_status "Installing coreutils for timeout command..."
+        brew install coreutils 2>/dev/null || {
+            print_warning "Could not install coreutils - using alternative timeout method"
+        }
+    fi
+    
     # Check if Docker is running
     if ! docker info &> /dev/null; then
         print_error "Docker is not running. Please start Docker Desktop."
@@ -142,11 +182,11 @@ check_dependencies() {
     # Quick network connectivity test
     print_status "Testing network connectivity..."
     if command -v curl &> /dev/null; then
-        if ! timeout 10s curl -s https://registry.k8s.io > /dev/null 2>&1; then
+        if run_with_timeout 10 curl -s https://registry.k8s.io > /dev/null 2>&1; then
+            print_success "Network connectivity OK"
+        else
             NETWORK_ISSUES=true
             print_warning "Network connectivity issues detected - will use offline/cached resources where possible"
-        else
-            print_success "Network connectivity OK"
         fi
     fi
 }
@@ -242,16 +282,21 @@ create_cluster() {
 install_cilium() {
     print_header "Installing Cilium CNI (Fast Mode)"
     
-    # Setup helm repo with retry
+    # Setup helm repo with simple retry (no timeout needed)
     local repo_success=false
     for attempt in 1 2 3; do
         print_status "Setting up Cilium repo (attempt $attempt/3)..."
-        if timeout 20s bash -c "helm repo remove cilium 2>/dev/null || true; helm repo add cilium https://helm.cilium.io/ && helm repo update"; then
+        
+        helm repo remove cilium 2>/dev/null || true
+        
+        if run_with_timeout 30 helm repo add cilium https://helm.cilium.io/ && run_with_timeout 30 helm repo update; then
             repo_success=true
+            print_success "Cilium repository added successfully"
             break
+        else
+            print_warning "Repo setup failed, retrying in 5 seconds..."
+            sleep 5
         fi
-        print_warning "Repo setup failed, retrying..."
-        sleep 5
     done
     
     if [[ "$repo_success" != "true" ]]; then
