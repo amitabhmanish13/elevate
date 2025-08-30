@@ -1,0 +1,117 @@
+# Grafana Configuration for Cilium/Hubble Demo
+persistence:
+  enabled: true
+  size: 2Gi
+
+service:
+  type: NodePort
+  nodePort: 32003
+
+# Admin credentials
+adminUser: admin
+adminPassword: admin123
+
+# Enable anonymous access for demo
+auth:
+  anonymous:
+    enabled: true
+    org_role: Viewer
+
+# Data sources
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        url: http://prometheus-server.monitoring.svc.cluster.local
+        access: proxy
+        isDefault: true
+
+# Dashboard providers
+dashboardProviders:
+  dashboardproviders.yaml:
+    apiVersion: 1
+    providers:
+      - name: 'cilium'
+        orgId: 1
+        folder: 'Cilium'
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards/cilium
+      - name: 'hubble'
+        orgId: 1
+        folder: 'Hubble'
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards/hubble
+      - name: 'demo-app'
+        orgId: 1
+        folder: 'Demo App'
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards/demo-app
+
+# Pre-configured dashboards
+dashboards:
+  cilium:
+    cilium-overview:
+      gnetId: 15513
+      revision: 1
+      datasource: Prometheus
+    cilium-operator:
+      gnetId: 15514
+      revision: 1
+      datasource: Prometheus
+  hubble:
+    hubble-overview:
+      gnetId: 15515
+      revision: 1
+      datasource: Prometheus
+  demo-app:
+    demo-app-metrics:
+      json: |
+        {
+          "dashboard": {
+            "id": null,
+            "title": "Demo Application Metrics",
+            "tags": ["demo", "application"],
+            "style": "dark",
+            "timezone": "browser",
+            "panels": [
+              {
+                "id": 1,
+                "title": "HTTP Requests Rate",
+                "type": "graph",
+                "targets": [
+                  {
+                    "expr": "rate(http_requests_total[5m])",
+                    "legendFormat": "{{method}} {{status}}"
+                  }
+                ]
+              },
+              {
+                "id": 2,
+                "title": "Response Time",
+                "type": "graph",
+                "targets": [
+                  {
+                    "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))",
+                    "legendFormat": "95th percentile"
+                  }
+                ]
+              }
+            ],
+            "time": {
+              "from": "now-1h",
+              "to": "now"
+            },
+            "refresh": "5s"
+          }
+        }

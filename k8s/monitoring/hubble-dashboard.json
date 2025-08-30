@@ -1,0 +1,88 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "Hubble Network Flows",
+    "tags": ["hubble", "flows", "network"],
+    "style": "dark",
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "HTTP Requests by Service",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum by (destination_service_name) (rate(hubble_http_requests_total[5m]))",
+            "legendFormat": "{{destination_service_name}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "HTTP Response Codes",
+        "type": "piechart",
+        "targets": [
+          {
+            "expr": "sum by (status) (rate(hubble_http_requests_total[5m]))",
+            "legendFormat": "{{status}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+      },
+      {
+        "id": 3,
+        "title": "DNS Queries",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum by (destination) (rate(hubble_dns_queries_total[5m]))",
+            "legendFormat": "{{destination}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+      },
+      {
+        "id": 4,
+        "title": "Network Policy Verdicts",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum by (verdict) (rate(hubble_flows_total[5m]))",
+            "legendFormat": "{{verdict}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+      },
+      {
+        "id": 5,
+        "title": "Top HTTP Endpoints",
+        "type": "table",
+        "targets": [
+          {
+            "expr": "topk(10, sum by (http_url) (rate(hubble_http_requests_total[5m])))",
+            "format": "table"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16}
+      },
+      {
+        "id": 6,
+        "title": "Service Communication Map",
+        "type": "nodeGraph",
+        "targets": [
+          {
+            "expr": "sum by (source_service_name, destination_service_name) (rate(hubble_flows_total[5m]))",
+            "format": "table"
+          }
+        ],
+        "gridPos": {"h": 10, "w": 24, "x": 0, "y": 24}
+      }
+    ],
+    "time": {
+      "from": "now-30m",
+      "to": "now"
+    },
+    "refresh": "10s"
+  }
+}

@@ -1,0 +1,61 @@
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: backend-policy
+  namespace: demo
+spec:
+  endpointSelector:
+    matchLabels:
+      app: backend
+  ingress:
+  # Allow traffic from frontend
+  - fromEndpoints:
+    - matchLabels:
+        app: frontend
+    toPorts:
+    - ports:
+      - port: "8080"
+        protocol: TCP
+  # Allow traffic from traffic generator
+  - fromEndpoints:
+    - matchLabels:
+        app: traffic-generator
+    toPorts:
+    - ports:
+      - port: "8080"
+        protocol: TCP
+  # Allow Prometheus scraping
+  - fromEndpoints:
+    - matchLabels:
+        k8s:io.kubernetes.pod.namespace: monitoring
+    toPorts:
+    - ports:
+      - port: "8080"
+        protocol: TCP
+  egress:
+  # Allow DNS
+  - toEndpoints:
+    - matchLabels:
+        k8s:io.kubernetes.pod.namespace: kube-system
+        k8s:app: kube-dns
+    toPorts:
+    - ports:
+      - port: "53"
+        protocol: UDP
+  # Allow communication to database
+  - toEndpoints:
+    - matchLabels:
+        app: postgres
+    toPorts:
+    - ports:
+      - port: "5432"
+        protocol: TCP
+  # Allow external HTTPS for demo external calls
+  - toEntities:
+    - "world"
+    toPorts:
+    - ports:
+      - port: "443"
+        protocol: TCP
+      - port: "80"
+        protocol: TCP
